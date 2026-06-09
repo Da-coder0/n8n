@@ -1,0 +1,160 @@
+{
+  "name": "Batch Image Generator - Kie AI Nano Banana 2",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Batch AI Image Generator",
+        "formDescription": "Upload your CSV of prompts and your character reference image. All images will be emailed to you as a ZIP and available to download when complete.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Email Address",
+              "fieldType": "email",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Prompts CSV",
+              "fieldType": "file",
+              "requiredField": true,
+              "acceptFileTypes": ".csv"
+            },
+            {
+              "fieldLabel": "Character Reference Image",
+              "fieldType": "file",
+              "requiredField": true,
+              "acceptFileTypes": ".png,.jpg,.jpeg,.webp"
+            }
+          ]
+        },
+        "responseMode": "lastNode"
+      },
+      "id": "node-form-trigger",
+      "name": "Form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [240, 300],
+      "webhookId": "batch-image-generator"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// CONFIGURATION — set your Kie AI API key in n8n Credentials\n// or replace the env var below with your key directly.\n// ============================================================\nconst KIE_API_KEY = $env['KIE_API_KEY'] ?? 'PASTE_YOUR_KIE_API_KEY_HERE';\nconst KIE_BASE = 'https://api.kie.ai/api/v1';\nconst POLL_INTERVAL_MS = 5000;   // how often to check task status\nconst MAX_POLL_ATTEMPTS = 144;   // 144 × 5s = 12 minutes max wait per task\nconst SUBMIT_DELAY_MS = 350;     // delay between task submissions (rate limit)\n\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n\n// ── 1. Extract form data ───────────────────────────────────\nconst formItem = $input.first();\nconst email = formItem.json['Email Address'];\n\n// ── 2. Parse CSV ───────────────────────────────────────────\nconst csvBin = formItem.binary?.['Prompts CSV'];\nif (!csvBin) throw new Error('No CSV file found in upload.');\n\nconst csvText = Buffer.from(csvBin.data, 'base64').toString('utf-8');\nconst lines = csvText\n  .replace(/\\r\\n/g, '\\n')\n  .replace(/\\r/g, '\\n')\n  .split('\\n')\n  .map((l) => l.trim())\n  .filter(Boolean);\n\n// Auto-detect header row\nconst firstLower = (lines[0] ?? '').toLowerCase();\nconst hasHeader =\n  firstLower.includes('prompt') ||\n  firstLower.includes('text') ||\n  firstLower.includes('description') ||\n  firstLower.includes('scene') ||\n  firstLower.includes('caption');\nconst startIdx = hasHeader ? 1 : 0;\n\nconst prompts = [];\nfor (let i = startIdx; i < lines.length; i++) {\n  // Strip surrounding quotes and unescape doubled quotes\n  const raw = lines[i].split(',')[0]; // take first CSV column\n  const prompt = raw.replace(/^\"|\"$/g, '').replace(/\"\"/g, '\"').trim();\n  if (prompt) prompts.push(prompt);\n}\n\nif (prompts.length === 0)\n  throw new Error('No prompts found in CSV. Make sure prompts are in the first column.');\n\n// ── 3. Upload reference image to Kie AI ───────────────────\nconst refBin = formItem.binary?.['Character Reference Image'];\nif (!refBin) throw new Error('No character reference image found in upload.');\n\nconst refBuffer = Buffer.from(refBin.data, 'base64');\nconst refMime = refBin.mimeType ?? 'image/jpeg';\nconst refName = refBin.fileName ?? 'character_reference.jpg';\n\nconst uploadForm = new FormData();\nuploadForm.append('file', new Blob([refBuffer], { type: refMime }), refName);\n\nconst uploadRes = await fetch(`${KIE_BASE}/upload`, {\n  method: 'POST',\n  headers: { Authorization: `Bearer ${KIE_API_KEY}` },\n  body: uploadForm,\n});\n\nif (!uploadRes.ok) {\n  const errBody = await uploadRes.text();\n  throw new Error(`Reference image upload failed (${uploadRes.status}): ${errBody}`);\n}\n\nconst uploadJson = await uploadRes.json();\nconst refImageUrl = uploadJson?.data?.url ?? uploadJson?.url;\nif (!refImageUrl)\n  throw new Error(`Upload response missing URL: ${JSON.stringify(uploadJson)}`);\n\n// ── 4. Submit all generation tasks ────────────────────────\nconst tasks = []; // { index, prompt, taskId | null, error }\n\nfor (let i = 0; i < prompts.length; i++) {\n  if (i > 0) await sleep(SUBMIT_DELAY_MS);\n\n  const createRes = await fetch(`${KIE_BASE}/jobs/createTask`, {\n    method: 'POST',\n    headers: {\n      Authorization: `Bearer ${KIE_API_KEY}`,\n      'Content-Type': 'application/json',\n    },\n    body: JSON.stringify({\n      model: 'nano-banana-2',\n      input: {\n        prompt: prompts[i],\n        image_input: [refImageUrl],\n        aspect_ratio: 'auto',\n        resolution: '1K',\n        output_format: 'png',\n      },\n    }),\n  });\n\n  if (!createRes.ok) {\n    const err = await createRes.text();\n    console.error(`[${i + 1}/${prompts.length}] Task create failed: ${err}`);\n    tasks.push({ index: i, prompt: prompts[i], taskId: null, error: err });\n    continue;\n  }\n\n  const createJson = await createRes.json();\n  const taskId = createJson?.data?.taskId ?? createJson?.taskId;\n  tasks.push({ index: i, prompt: prompts[i], taskId });\n}\n\n// ── 5. Poll all tasks until every one completes ───────────\nconst imageUrls = new Array(prompts.length).fill(null);\nconst pollCount = {};\nconst pending = new Set(\n  tasks.filter((t) => t.taskId).map((t) => t.index)\n);\nfor (const idx of pending) pollCount[idx] = 0;\n\nwhile (pending.size > 0) {\n  await sleep(POLL_INTERVAL_MS);\n\n  const done = [];\n  for (const i of pending) {\n    pollCount[i]++;\n    if (pollCount[i] > MAX_POLL_ATTEMPTS) {\n      console.error(`Task ${i + 1} timed out.`);\n      done.push(i);\n      continue;\n    }\n\n    const { taskId } = tasks[i];\n    try {\n      const pollRes = await fetch(\n        `${KIE_BASE}/jobs/getTaskDetail?taskId=${taskId}`,\n        { headers: { Authorization: `Bearer ${KIE_API_KEY}` } }\n      );\n      if (!pollRes.ok) continue;\n\n      const pollJson = await pollRes.json();\n      const status = (pollJson?.data?.status ?? '').toUpperCase();\n\n      if (status === 'SUCCESS' || status === 'COMPLETED') {\n        const output = pollJson?.data?.output;\n        imageUrls[i] = Array.isArray(output) ? output[0] : output;\n        done.push(i);\n      } else if (status === 'FAILED' || status === 'ERROR') {\n        console.error(`Task ${i + 1} failed on server.`);\n        done.push(i);\n      }\n    } catch (e) {\n      console.error(`Poll error for task ${i + 1}: ${e.message}`);\n    }\n  }\n\n  for (const i of done) pending.delete(i);\n}\n\n// ── 6. Download all generated images ──────────────────────\nconst resultItems = [];\n\nfor (let i = 0; i < imageUrls.length; i++) {\n  const url = imageUrls[i];\n  if (!url) continue;\n\n  try {\n    const imgRes = await fetch(url);\n    if (!imgRes.ok) {\n      console.error(`Download failed for image ${i + 1}: ${imgRes.status}`);\n      continue;\n    }\n\n    const imgBuffer = Buffer.from(await imgRes.arrayBuffer());\n    const pad = String(i + 1).padStart(3, '0');\n\n    resultItems.push({\n      json: {\n        email,\n        prompt: prompts[i],\n        index: i + 1,\n        totalGenerated: imageUrls.filter(Boolean).length,\n        totalRequested: prompts.length,\n        imageUrl: url,\n      },\n      binary: {\n        image: {\n          data: imgBuffer.toString('base64'),\n          mimeType: 'image/png',\n          fileName: `image_${pad}.png`,\n          fileExtension: 'png',\n        },\n      },\n    });\n  } catch (e) {\n    console.error(`Error downloading image ${i + 1}: ${e.message}`);\n  }\n}\n\nif (resultItems.length === 0)\n  throw new Error(\n    'No images were generated successfully. Check your API key, prompts, and Kie AI credits.'\n  );\n\nreturn resultItems;\n"
+      },
+      "id": "node-batch-generate",
+      "name": "Batch Generate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "operation": "zip",
+        "inputBinaryFieldName": "image",
+        "outputBinaryFieldName": "data",
+        "fileName": "generated_images"
+      },
+      "id": "node-zip",
+      "name": "ZIP Images",
+      "type": "n8n-nodes-base.compression",
+      "typeVersion": 1.1,
+      "position": [760, 300]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Batch Generate').first().json.email }}",
+        "subject": "Your {{ $('Batch Generate').first().json.totalGenerated }} Generated Images are Ready!",
+        "emailType": "text",
+        "message": "Hi there!\n\nYour batch image generation is complete.\n\n✅ Generated: {{ $('Batch Generate').first().json.totalGenerated }} / {{ $('Batch Generate').first().json.totalRequested }} images\n\nThe ZIP file containing all your images is attached to this email.\n\nEnjoy your images!",
+        "options": {
+          "attachments": "data"
+        }
+      },
+      "id": "node-email",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1020, 200],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_YOUR_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "binary",
+        "inputBinaryField": "data",
+        "options": {
+          "responseHeaders": {
+            "values": [
+              {
+                "name": "Content-Disposition",
+                "value": "attachment; filename=\"generated_images.zip\""
+              },
+              {
+                "name": "Content-Type",
+                "value": "application/zip"
+              }
+            ]
+          }
+        }
+      },
+      "id": "node-respond",
+      "name": "Download Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1020, 420]
+    }
+  ],
+  "connections": {
+    "Form": {
+      "main": [
+        [
+          {
+            "node": "Batch Generate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Generate": {
+      "main": [
+        [
+          {
+            "node": "ZIP Images",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ZIP Images": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Download Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["image-generation", "batch", "kie-ai"],
+  "triggerCount": 1,
+  "versionId": "1"
+}
