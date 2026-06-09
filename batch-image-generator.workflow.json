@@ -82,27 +82,15 @@
     },
     {
       "parameters": {
-        "respondWith": "binary",
-        "inputBinaryField": "data",
-        "options": {
-          "responseHeaders": {
-            "values": [
-              {
-                "name": "Content-Disposition",
-                "value": "attachment; filename=\"generated_images.zip\""
-              },
-              {
-                "name": "Content-Type",
-                "value": "application/zip"
-              }
-            ]
-          }
-        }
+        "operation": "completion",
+        "completionTitle": "Your images are on their way!",
+        "completionMessage": "={{ 'All done! ' + $('Batch Generate').first().json.totalGenerated + ' images have been generated and sent as a ZIP to ' + $('Batch Generate').first().json.email + '. Check your inbox — it should arrive within a minute.' }}",
+        "options": {}
       },
       "id": "node-respond",
-      "name": "Download Response",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
+      "name": "Form Completion",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 1,
       "position": [1020, 420]
     }
   ],
@@ -138,7 +126,7 @@
             "index": 0
           },
           {
-            "node": "Download Response",
+            "node": "Form Completion",
             "type": "main",
             "index": 0
           }
