@@ -1,0 +1,51 @@
+{
+  "name": "Batch Image Generator — Baserow + Kie AI",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node-manual-trigger",
+      "name": "Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// CONFIGURATION\n// ============================================================\nconst KIE_API_KEY        = $env['KIE_API_KEY']        ?? 'PASTE_YOUR_KIE_API_KEY_HERE';\nconst BASEROW_TOKEN      = $env['BASEROW_TOKEN']       ?? 'PASTE_YOUR_BASEROW_TOKEN_HERE';\nconst BASEROW_TABLE_ID   = $env['BASEROW_TABLE_ID']    ?? 'YOUR_TABLE_ID';  // numeric ID from Baserow URL\nconst BASEROW_BASE_URL   = $env['BASEROW_BASE_URL']    ?? 'https://api.baserow.io'; // change if self-hosted\n\n// URL of your character reference image (Rick, or whoever your character is).\n// Upload your image anywhere public (Cloudinary, S3, Kie AI upload, etc.)\n// and paste the direct URL here.\nconst CHARACTER_REF_URL  = $env['CHARACTER_REF_URL']   ?? 'PASTE_YOUR_CHARACTER_IMAGE_URL_HERE';\n\nconst KIE_BASE           = 'https://api.kie.ai/api/v1';\nconst POLL_INTERVAL_MS   = 5000;   // poll every 5 seconds\nconst MAX_POLL_ATTEMPTS  = 144;    // 12 minutes max per image\nconst SUBMIT_DELAY_MS    = 350;    // rate-limit buffer between submissions\nconst MAX_RETRIES        = 3;      // retry failed generations up to 3 times\n\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n\n// ── Baserow helpers ───────────────────────────────────────\nconst brHeaders = {\n  Authorization: `Token ${BASEROW_TOKEN}`,\n  'Content-Type': 'application/json',\n};\n\nasync function brGet(path) {\n  const res = await fetch(`${BASEROW_BASE_URL}${path}`, { headers: brHeaders });\n  if (!res.ok) throw new Error(`Baserow GET ${path} → ${res.status}: ${await res.text()}`);\n  return res.json();\n}\n\nasync function brPatch(rowId, fields) {\n  const res = await fetch(\n    `${BASEROW_BASE_URL}/api/database/rows/table/${BASEROW_TABLE_ID}/${rowId}/?user_field_names=true`,\n    { method: 'PATCH', headers: brHeaders, body: JSON.stringify(fields) }\n  );\n  if (!res.ok) throw new Error(`Baserow PATCH row ${rowId} → ${res.status}: ${await res.text()}`);\n  return res.json();\n}\n\n// ── 1. Fetch all pending image-gen rows ───────────────────\n// Expects your Baserow table to have these fields:\n//   status      : text  (pending / processing / completed / failed)\n//   mode        : text  (image_gen  ← only these rows are processed here)\n//   image_prompt: text\n//   image_url   : text  (filled in by this workflow)\n\nlet allRows = [];\nlet page = 1;\nwhile (true) {\n  const data = await brGet(\n    `/api/database/rows/table/${BASEROW_TABLE_ID}/?user_field_names=true&size=200&page=${page}`\n  );\n  allRows = allRows.concat(data.results);\n  if (!data.next) break;\n  page++;\n}\n\nconst pendingRows = allRows.filter(\n  (r) => (r.status ?? '').toLowerCase() === 'pending' &&\n          (r.mode   ?? '').toLowerCase() === 'image_gen'\n);\n\nif (pendingRows.length === 0) {\n  return [{ json: { message: 'No pending image_gen rows found. Nothing to do.' } }];\n}\n\n// ── 2. Mark all as \"processing\" immediately ───────────────\nfor (const row of pendingRows) {\n  await brPatch(row.id, { status: 'processing' });\n  await sleep(100);\n}\n\n// ── 3. Submit all Kie AI tasks ────────────────────────────\nconst tasks = []; // { rowId, prompt, taskId, retries }\n\nfor (let i = 0; i < pendingRows.length; i++) {\n  if (i > 0) await sleep(SUBMIT_DELAY_MS);\n  const row = pendingRows[i];\n  const prompt = row.image_prompt ?? row.prompt ?? '';\n\n  if (!prompt) {\n    await brPatch(row.id, { status: 'failed' });\n    continue;\n  }\n\n  try {\n    const res = await fetch(`${KIE_BASE}/jobs/createTask`, {\n      method: 'POST',\n      headers: { Authorization: `Bearer ${KIE_API_KEY}`, 'Content-Type': 'application/json' },\n      body: JSON.stringify({\n        model: 'nano-banana-2',\n        input: {\n          prompt,\n          image_input: CHARACTER_REF_URL ? [CHARACTER_REF_URL] : [],\n          aspect_ratio: 'auto',\n          resolution: '1K',\n          output_format: 'png',\n        },\n      }),\n    });\n\n    if (!res.ok) {\n      console.error(`Row ${row.id}: createTask failed (${res.status})`);\n      tasks.push({ rowId: row.id, prompt, taskId: null, retries: 0 });\n      continue;\n    }\n\n    const json = await res.json();\n    const taskId = json?.data?.taskId ?? json?.taskId;\n    tasks.push({ rowId: row.id, prompt, taskId, retries: 0 });\n  } catch (e) {\n    console.error(`Row ${row.id}: submit error — ${e.message}`);\n    tasks.push({ rowId: row.id, prompt, taskId: null, retries: 0 });\n  }\n}\n\n// ── 4. Poll until all tasks complete ─────────────────────\nconst pollCount = {};\nconst pending = new Set(tasks.filter((t) => t.taskId).map((_, i) => i));\nfor (const i of pending) pollCount[i] = 0;\n\nwhile (pending.size > 0) {\n  await sleep(POLL_INTERVAL_MS);\n  const done = [];\n\n  for (const i of pending) {\n    pollCount[i]++;\n    if (pollCount[i] > MAX_POLL_ATTEMPTS) {\n      console.error(`Task ${i} timed out`);\n      done.push(i);\n      continue;\n    }\n\n    try {\n      const res = await fetch(\n        `${KIE_BASE}/jobs/getTaskDetail?taskId=${tasks[i].taskId}`,\n        { headers: { Authorization: `Bearer ${KIE_API_KEY}` } }\n      );\n      if (!res.ok) continue;\n\n      const json = await res.json();\n      const status = (json?.data?.status ?? '').toUpperCase();\n\n      if (status === 'SUCCESS' || status === 'COMPLETED') {\n        const output = json?.data?.output;\n        tasks[i].imageUrl = Array.isArray(output) ? output[0] : output;\n        done.push(i);\n      } else if (status === 'FAILED' || status === 'ERROR') {\n        console.error(`Task ${i} (row ${tasks[i].rowId}) failed on Kie AI`);\n        tasks[i].failed = true;\n        done.push(i);\n      }\n    } catch (e) {\n      console.error(`Poll error task ${i}: ${e.message}`);\n    }\n  }\n\n  for (const i of done) pending.delete(i);\n}\n\n// ── 5. Retry failed tasks (up to MAX_RETRIES times) ──────\nconst failedTasks = tasks.filter((t) => !t.imageUrl && t.retries < MAX_RETRIES);\n\nfor (const task of failedTasks) {\n  let imageUrl = null;\n\n  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n    await sleep(2000 * attempt); // back-off\n    try {\n      const createRes = await fetch(`${KIE_BASE}/jobs/createTask`, {\n        method: 'POST',\n        headers: { Authorization: `Bearer ${KIE_API_KEY}`, 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          model: 'nano-banana-2',\n          input: {\n            prompt: task.prompt,\n            image_input: CHARACTER_REF_URL ? [CHARACTER_REF_URL] : [],\n            aspect_ratio: 'auto',\n            resolution: '1K',\n            output_format: 'png',\n          },\n        }),\n      });\n      if (!createRes.ok) continue;\n      const createJson = await createRes.json();\n      const retryTaskId = createJson?.data?.taskId ?? createJson?.taskId;\n      if (!retryTaskId) continue;\n\n      // Poll this retry\n      for (let p = 0; p < MAX_POLL_ATTEMPTS; p++) {\n        await sleep(POLL_INTERVAL_MS);\n        const pollRes = await fetch(\n          `${KIE_BASE}/jobs/getTaskDetail?taskId=${retryTaskId}`,\n          { headers: { Authorization: `Bearer ${KIE_API_KEY}` } }\n        );\n        if (!pollRes.ok) continue;\n        const pollJson = await pollRes.json();\n        const st = (pollJson?.data?.status ?? '').toUpperCase();\n        if (st === 'SUCCESS' || st === 'COMPLETED') {\n          const output = pollJson?.data?.output;\n          imageUrl = Array.isArray(output) ? output[0] : output;\n          break;\n        } else if (st === 'FAILED' || st === 'ERROR') {\n          break;\n        }\n      }\n      if (imageUrl) break;\n    } catch (e) {\n      console.error(`Retry ${attempt} error for row ${task.rowId}: ${e.message}`);\n    }\n  }\n\n  task.imageUrl = imageUrl ?? null;\n}\n\n// ── 6. Write results back to Baserow ─────────────────────\nlet completed = 0;\nlet failed = 0;\n\nfor (const task of tasks) {\n  if (task.imageUrl) {\n    await brPatch(task.rowId, { status: 'completed', image_url: task.imageUrl });\n    completed++;\n  } else {\n    await brPatch(task.rowId, { status: 'failed' });\n    failed++;\n  }\n  await sleep(100);\n}\n\nreturn [{\n  json: {\n    message: `Done. ${completed} completed, ${failed} failed out of ${tasks.length} rows.`,\n    completed,\n    failed,\n    total: tasks.length,\n  },\n}];\n"
+      },
+      "id": "node-generate",
+      "name": "Generate Images",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "content": "## Results\n`{{ $json.message }}`\n\n- ✅ Completed: `{{ $json.completed }}`\n- ❌ Failed: `{{ $json.failed }}`\n- 📋 Total: `{{ $json.total }}`",
+        "height": 160,
+        "width": 320
+      },
+      "id": "node-note",
+      "name": "Summary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [720, 220]
+    }
+  ],
+  "connections": {
+    "Run": {
+      "main": [
+        [{ "node": "Generate Images", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "staticData": null,
+  "tags": ["image-generation", "baserow", "kie-ai", "batch"],
+  "triggerCount": 0,
+  "versionId": "2"
+}
